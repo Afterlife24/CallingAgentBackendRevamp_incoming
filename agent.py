@@ -73,10 +73,18 @@ def _register_session_events(session: AgentSession) -> None:
             logger.info(f"[STT] Final: {ev.transcript}")
 
 
+SUPPORTED_LANGUAGES = {
+    "en": "English",
+    "ar": "Arabic",
+    "fr": "French",
+}
+
+
 class InboundCaller(Agent):
     def __init__(self):
         super().__init__(instructions=AGENT_INSTRUCTION)
         self.participant: rtc.RemoteParticipant | None = None
+        self.current_language: str = "en"
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
@@ -86,6 +94,24 @@ class InboundCaller(Agent):
         await job_ctx.api.room.delete_room(
             api.DeleteRoomRequest(room=job_ctx.room.name)
         )
+
+    @function_tool()
+    async def switch_language(self, ctx: RunContext, language: str):
+        """Switch the conversation language. Call this when the caller explicitly asks to speak in Arabic ('ar'), French ('fr'), or English ('en')."""
+        lang = language.strip().lower()
+        if lang not in SUPPORTED_LANGUAGES:
+            return f"Unsupported language '{language}'. Supported: English (en), Arabic (ar), French (fr)."
+
+        if lang == self.current_language:
+            return f"Already speaking in {SUPPORTED_LANGUAGES[lang]}."
+
+        session: AgentSession = ctx.session
+        session.stt.update_options(language=lang)
+        session.tts.update_options(language=lang)
+        self.current_language = lang
+        logger.info(
+            f"[LANGUAGE] Switched to {SUPPORTED_LANGUAGES[lang]} ({lang})")
+        return f"Switched to {SUPPORTED_LANGUAGES[lang]}. Continue the conversation in {SUPPORTED_LANGUAGES[lang]} now."
 
     @function_tool()
     async def end_call(self, ctx: RunContext):
