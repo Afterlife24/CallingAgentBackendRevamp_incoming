@@ -38,7 +38,15 @@ An AI-powered inbound phone call agent built with [LiveKit Agents](https://docs.
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment variables
+### 2. Download model files
+
+Download required ML model files (Silero VAD, turn detector, etc.):
+
+```bash
+python agent.py download-files
+```
+
+### 3. Configure environment variables
 
 Create a `.env` file in the project root:
 
@@ -58,7 +66,7 @@ TWIML_PASSWORD=your_twiml_password
 INBOUND_ALLOWED_NUMBERS=+1111111111,+2222222222
 ```
 
-### 3. Set up SIP trunk and dispatch rule
+### 4. Set up SIP trunk and dispatch rule
 
 Run this once to create the inbound trunk and dispatch rule on LiveKit:
 
@@ -72,7 +80,7 @@ If you need to start fresh (delete all trunks/rules and recreate):
 python cleanup_and_setup.py
 ```
 
-### 4. Run the agent
+### 5. Run the agent
 
 ```bash
 python agent.py dev

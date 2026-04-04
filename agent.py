@@ -30,7 +30,7 @@ from livekit.plugins import (
 )
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-from prompts import AGENT_INSTRUCTION, GREETING_INSTRUCTION
+from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
 
 load_dotenv()
 logger = logging.getLogger("inbound-caller")
@@ -183,7 +183,7 @@ async def entrypoint(ctx: JobContext):
 
     # Greet the caller — agent speaks first
     await session.generate_reply(
-        instructions=GREETING_INSTRUCTION,
+        instructions=SESSION_INSTRUCTION,
         allow_interruptions=False,
     )
     logger.info("Greeting sent — agent is now listening")
