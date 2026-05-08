@@ -431,7 +431,10 @@ async def entrypoint(ctx: JobContext):
         await agent.log_call_to_backend(status="ongoing")
 
     session = AgentSession(
-        stt=cartesia.STT(model="ink-whisper", language="en"),
+        stt=cartesia.STT(
+            model="ink-whisper",  # Cartesia's multilingual STT model (supports English, Arabic, French)
+            language="en"  # Start with English, can switch dynamically
+        ),
         llm=openai.LLM(
             model="llama-3.3-70b-versatile",  # This model supports prompt caching
             base_url="https://api.groq.com/openai/v1",
