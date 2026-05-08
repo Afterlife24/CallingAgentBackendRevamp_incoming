@@ -8,3 +8,5 @@ livekit-plugins-turn-detector
 torch
 huggingface_hub
 python-dotenv~=1.0
+tzdata
+aiohttp
