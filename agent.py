@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
 import aiohttp
 from datetime import datetime
 
@@ -26,11 +27,10 @@ from livekit.agents import (
 )
 from livekit.plugins import (
     cartesia,
-    openai,
+    groq,
     noise_cancellation,
-    silero,
 )
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents import inference
 
 from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
 
@@ -39,7 +39,8 @@ logger = logging.getLogger("inbound-caller")
 logger.setLevel(logging.INFO)
 
 # Suppress harmless Windows IPC errors
-logging.getLogger("livekit.agents.utils.aio.duplex_unix").setLevel(logging.CRITICAL)
+logging.getLogger("livekit.agents.utils.aio.duplex_unix").setLevel(
+    logging.CRITICAL)
 
 
 def _register_session_events(session: AgentSession, agent) -> None:
@@ -49,8 +50,26 @@ def _register_session_events(session: AgentSession, agent) -> None:
     def on_session_close():
         # Log final call data with lead score to backend when session closes
         import asyncio
-        asyncio.create_task(agent.log_call_to_backend(status="completed", end_time=datetime.now()))
-        
+        asyncio.create_task(agent.log_call_to_backend(
+            status="completed", end_time=datetime.now()))
+
+        # Print lead score summary
+        ls = agent.lead_score
+        logger.info("=" * 60)
+        logger.info("[LEAD SCORE SUMMARY]")
+        logger.info(f"  Score:       {ls['totalScore']}/100")
+        logger.info(f"  Priority:    {ls['priority']}")
+        logger.info(f"  Business:    {ls['businessType'] or 'N/A'}")
+        logger.info(
+            f"  Channels:    {', '.join(ls['customerChannels']) if ls['customerChannels'] else 'N/A'}")
+        logger.info(
+            f"  Pain Points: {', '.join(ls['painPoints']) if ls['painPoints'] else 'N/A'}")
+        logger.info(f"  Timeline:    {ls['timeline'] or 'N/A'}")
+        logger.info(
+            f"  Confidence:  {', '.join(ls['confidenceSignals']) if ls['confidenceSignals'] else 'N/A'}")
+        logger.info(f"  Reasoning:   {ls['recommendedSolution'] or 'N/A'}")
+        logger.info("=" * 60)
+
         usage = session.usage
         if usage and usage.model_usage:
             for mu in usage.model_usage:
@@ -105,7 +124,15 @@ class InboundCaller(Agent):
         self.call_id: str | None = None
         self.room_name: str | None = None
         self.transcript_buffer: list = []
-        
+
+        # Tool sequencing guards (Task B)
+        # _form_done is set when no send_form is in flight. end_call waits on it
+        # so we never hang up mid-request. _form_sent marks a successful send.
+        self._form_done = asyncio.Event()
+        self._form_done.set()
+        self._form_sent = False
+        self._ending = False  # guards against end_call running twice
+
         # Lead scoring attributes
         self.lead_score = {
             "totalScore": 0,
@@ -166,9 +193,11 @@ class InboundCaller(Agent):
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as response:
                     if response.status == 200:
-                        logger.info(f"[BACKEND] Call log sent successfully for {phone_number} with score {self.lead_score['totalScore']}")
+                        logger.info(
+                            f"[BACKEND] Call log sent successfully for {phone_number} with score {self.lead_score['totalScore']}")
                     else:
-                        logger.error(f"[BACKEND] Failed to send call log: {response.status}")
+                        logger.error(
+                            f"[BACKEND] Failed to send call log: {response.status}")
         except Exception as e:
             logger.error(f"[BACKEND] Error sending call log: {e}")
 
@@ -179,149 +208,89 @@ class InboundCaller(Agent):
         )
 
     @function_tool()
-    async def calculate_lead_score(
-        self, 
+    async def score_and_route_lead(
+        self,
         ctx: RunContext,
+        total_score: str,
+        priority: str,
         business_type: str = "",
         channels: str = "",
         pain_points: str = "",
         timeline: str = "",
-        confidence_signals: str = ""
+        confidence_signals: str = "",
+        reasoning: str = ""
     ):
-        """Calculate and store lead score based on conversation signals. Call this before routing the customer.
-        
+        """Score the lead after catching their intent (2-3 qualifying questions). Do NOT call this on the first message.
+        You should understand their business and main problem before calling.
+
+        Scoring guide:
+        - Business Stage (0-20): Established=20, Growing=15, Startup=10
+        - Channels needed (0-20): 3+=20, 2=15, 1=10
+        - Pain Points (0-25): Quantified problem=25, Clear pain=20, General need=10
+        - Timeline (0-20): ASAP=20, This month=15, Next quarter=10, Exploring=5
+        - Confidence Signals (0-15): Pricing ask=15, Budget mention=12, Decision maker=10
+
         Args:
-            business_type: Type of business (e.g., "established e-commerce", "new startup", "growing agency")
-            channels: Customer channels mentioned (e.g., "WhatsApp", "phone and WhatsApp", "multi-channel")
-            pain_points: Pain points described (e.g., "500+ messages daily", "overwhelmed", "need automation")
-            timeline: Timeline mentioned (e.g., "ASAP", "this month", "exploring")
-            confidence_signals: Confidence signals detected (e.g., "asks pricing", "mentions budget", "decision maker")
+            total_score: Your assessed score from 0-100 as a number (e.g. "80")
+            priority: One of "HOT" (75-100), "WARM" (50-74), "COOL" (25-49), "LOW" (0-24)
+            business_type: What kind of business they run (from conversation)
+            channels: Communication channels they mentioned needing
+            pain_points: Their pain points as you understood them
+            timeline: Their timeline/urgency as you understood it
+            confidence_signals: Buying signals you detected (pricing questions, decision maker, etc.)
+            reasoning: Brief explanation of why you gave this score
         """
-        score_breakdown = {
-            "businessType": 0,
-            "channels": 0,
-            "painPoints": 0,
-            "timeline": 0,
-            "confidenceSignals": 0
-        }
-        
-        # Business Type Scoring (0-20)
-        business_lower = business_type.lower()
-        if any(word in business_lower for word in ["established", "years", "running for"]):
-            score_breakdown["businessType"] = 20
-            self.lead_score["businessType"] = business_type
-        elif any(word in business_lower for word in ["growing", "expanding"]):
-            score_breakdown["businessType"] = 15
-            self.lead_score["businessType"] = business_type
-        elif any(word in business_lower for word in ["startup", "new", "just launched"]):
-            score_breakdown["businessType"] = 10
-            self.lead_score["businessType"] = business_type
-        
-        # Channels Scoring (0-20)
-        channels_lower = channels.lower()
-        channel_list = []
-        if "whatsapp" in channels_lower:
-            channel_list.append("WhatsApp")
-        if any(word in channels_lower for word in ["phone", "call", "voice"]):
-            channel_list.append("Phone")
-        if any(word in channels_lower for word in ["web", "website", "chat"]):
-            channel_list.append("Web")
-        
-        if len(channel_list) >= 3:
-            score_breakdown["channels"] = 20
-        elif len(channel_list) == 2:
-            score_breakdown["channels"] = 15
-        elif len(channel_list) == 1:
-            score_breakdown["channels"] = 10
-        
-        self.lead_score["customerChannels"] = channel_list
-        
-        # Pain Points Scoring (0-25)
-        pain_lower = pain_points.lower()
-        pain_list = []
-        if any(num in pain_points for num in ["100+", "200+", "500+", "1000+", "50+"]):
-            score_breakdown["painPoints"] = 25
-            pain_list.append(f"Quantified problem: {pain_points}")
-        elif any(word in pain_lower for word in ["overwhelmed", "can't handle", "missing", "losing"]):
-            score_breakdown["painPoints"] = 20
-            pain_list.append(pain_points)
-        elif any(word in pain_lower for word in ["need", "want", "looking for", "automation"]):
-            score_breakdown["painPoints"] = 10
-            pain_list.append(pain_points)
-        
-        self.lead_score["painPoints"] = pain_list
-        
-        # Timeline Scoring (0-20)
-        timeline_lower = timeline.lower()
-        if any(word in timeline_lower for word in ["asap", "urgent", "immediately", "now", "this week"]):
-            score_breakdown["timeline"] = 20
-            self.lead_score["timeline"] = "ASAP/Urgent"
-        elif any(word in timeline_lower for word in ["this month", "soon", "next few weeks"]):
-            score_breakdown["timeline"] = 15
-            self.lead_score["timeline"] = "This month"
-        elif any(word in timeline_lower for word in ["next month", "next quarter", "q2", "q3"]):
-            score_breakdown["timeline"] = 10
-            self.lead_score["timeline"] = "Next quarter"
-        elif any(word in timeline_lower for word in ["exploring", "looking into", "researching", "just browsing"]):
-            score_breakdown["timeline"] = 5
-            self.lead_score["timeline"] = "Exploring"
-        
-        # Confidence Signals Scoring (0-15)
-        confidence_lower = confidence_signals.lower()
-        confidence_list = []
-        if any(word in confidence_lower for word in ["price", "pricing", "cost", "how much"]):
-            score_breakdown["confidenceSignals"] += 15
-            confidence_list.append("Asks about pricing")
-        if "budget" in confidence_lower:
-            score_breakdown["confidenceSignals"] += 12
-            confidence_list.append("Mentions budget")
-        if any(word in confidence_lower for word in ["owner", "i run", "my business", "decision maker"]):
-            score_breakdown["confidenceSignals"] += 10
-            confidence_list.append("Decision maker")
-        if any(word in confidence_lower for word in ["team", "employees", "agents", "staff"]):
-            score_breakdown["confidenceSignals"] += 8
-            confidence_list.append("Mentions team size")
-        if any(word in confidence_lower for word in ["comparing", "looking at options", "other solutions"]):
-            score_breakdown["confidenceSignals"] += 8
-            confidence_list.append("Comparing solutions")
-        
-        # Cap confidence signals at 15
-        score_breakdown["confidenceSignals"] = min(score_breakdown["confidenceSignals"], 15)
-        self.lead_score["confidenceSignals"] = confidence_list
-        
-        # Calculate total score
-        total_score = sum(score_breakdown.values())
-        self.lead_score["totalScore"] = total_score
-        self.lead_score["breakdown"] = score_breakdown
-        
-        # Determine priority
-        if total_score >= 75:
-            priority = "HOT"
-        elif total_score >= 50:
-            priority = "WARM"
-        elif total_score >= 25:
-            priority = "COOL"
-        else:
-            priority = "LOW"
-        
-        self.lead_score["priority"] = priority
-        
-        # Generate recommended solution
-        solution_parts = []
-        if channel_list:
-            if len(channel_list) > 1:
-                solution_parts.append(f"Multi-channel AI agent ({', '.join(channel_list)})")
+        # Coerce score to int — LLMs often emit numbers as strings.
+        try:
+            score_int = int(str(total_score).strip())
+        except (ValueError, TypeError):
+            score_int = 0
+        score_int = max(0, min(100, score_int))
+
+        # Normalize priority; derive from score if the model sent something odd.
+        priority = (priority or "").strip().upper()
+        if priority not in ("HOT", "WARM", "COOL", "LOW"):
+            if score_int >= 75:
+                priority = "HOT"
+            elif score_int >= 50:
+                priority = "WARM"
+            elif score_int >= 25:
+                priority = "COOL"
             else:
-                solution_parts.append(f"Custom {channel_list[0]} AI agent")
-        
-        if business_type:
-            solution_parts.append(f"for {business_type}")
-        
-        self.lead_score["recommendedSolution"] = " ".join(solution_parts) if solution_parts else "Custom AI agent solution"
-        
-        logger.info(f"[LEAD SCORE] Total: {total_score}/100 | Priority: {priority} | Breakdown: {score_breakdown}")
-        
-        return f"Lead scored: {total_score}/100 points - {priority} priority. Route accordingly: HOT/WARM → Appointment, COOL → Form, LOW → Soft close."
+                priority = "LOW"
+
+        # Store the LLM's assessment
+        self.lead_score["totalScore"] = score_int
+        self.lead_score["priority"] = priority
+        self.lead_score["businessType"] = business_type
+        self.lead_score["customerChannels"] = [
+            c.strip() for c in channels.split(",") if c.strip()] if channels else []
+        self.lead_score["painPoints"] = [pain_points] if pain_points else []
+        self.lead_score["timeline"] = timeline
+        self.lead_score["confidenceSignals"] = [c.strip() for c in confidence_signals.split(
+            ",") if c.strip()] if confidence_signals else []
+        self.lead_score["recommendedSolution"] = reasoning
+
+        logger.info(
+            f"[LEAD SCORE] LLM assessed: {score_int}/100 | Priority: {priority} | Reasoning: {reasoning}")
+
+        # Return routing instruction — ALWAYS ask for consent before sending.
+        # Do NOT tell the model to send directly; it must offer, explain value, and wait for a yes.
+        if priority in ("HOT", "WARM"):
+            return (f"Lead scored {score_int}/100 — {priority}. "
+                    f"Now OFFER a booking link: explain that our team can walk them through setup/pricing, "
+                    f"and you can send a booking link to their WhatsApp to pick a time — no commitment. "
+                    f"ASK if they'd like that. Do NOT call send_form yet — wait for them to say yes.")
+        elif priority == "COOL":
+            return (f"Lead scored {score_int}/100 — {priority}. "
+                    f"Now OFFER a short requirements form: explain it takes a minute to fill out, "
+                    f"our team will put together options tailored to their business — no commitment. "
+                    f"ASK if they'd like it sent to their WhatsApp. Do NOT call send_form yet — wait for yes.")
+        else:
+            return (f"Lead scored {score_int}/100 — {priority}. "
+                    f"OFFER a quick info form: explain our team can share more tailored info if they fill it out — "
+                    f"no commitment, just helps us understand their needs better. ASK if they'd like it. "
+                    f"Do NOT call send_form unless they say yes. If they decline, just end the call warmly.")
 
     @function_tool()
     async def switch_language(self, ctx: RunContext, language: str):
@@ -342,41 +311,68 @@ class InboundCaller(Agent):
         return f"Switched to {SUPPORTED_LANGUAGES[lang]}. Continue the conversation in {SUPPORTED_LANGUAGES[lang]} now."
 
     @function_tool()
+    @function_tool()
     async def end_call(self, ctx: RunContext):
-        """Called when the user wants to end the call"""
-        logger.info(f"ending the call for {self.participant.identity}")
-        
+        """End the call. A warm goodbye will be spoken automatically before hanging up.
+        Call this when the conversation is over — either after send_form, or when the user declines and you want to close."""
+        # Guard: don't run the hangup sequence more than once
+        if self._ending:
+            return
+        self._ending = True
+
+        identity = self.participant.identity if self.participant else "console"
+        logger.info(f"ending the call for {identity}")
+
+        # If a send_form request is still in flight, wait for it to finish
+        try:
+            await asyncio.wait_for(self._form_done.wait(), timeout=12.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[END] send_form still in flight after 12s, proceeding to hang up")
+
+        # Speak a fixed goodbye — no LLM generation needed.
+        # If the form was sent, mention it; otherwise, just a warm close.
+        if self._form_sent:
+            goodbye = "You'll get it on WhatsApp in just a moment. Our team will reach out from there. Thanks so much for your time today, and have a great day!"
+        else:
+            goodbye = "No problem at all. Feel free to reach out whenever you're ready. Thanks for your time — have a great day!"
+
+        try:
+            await ctx.session.say(goodbye, allow_interruptions=False)
+        except Exception as e:
+            logger.warning(f"[END] failed to speak goodbye: {e}")
+            try:
+                await ctx.wait_for_playout()
+            except Exception:
+                pass
+
         # Log call completion to backend
         await self.log_call_to_backend(status="completed", end_time=datetime.now())
-        
-        # Wait for the goodbye message to finish playing
-        await ctx.wait_for_playout()
-        
-        # Wait 5 seconds before hanging up
-        import asyncio
-        await asyncio.sleep(5)
-        
-        # Hang up the call
-        await self.hangup()
+
+        # Hang up the call (skip in console mode)
+        if self.participant:
+            await self.hangup()
 
     @function_tool()
     async def send_form(self, ctx: RunContext):
-        """Automatically send the form via WhatsApp/SMS when user agrees to receive it. Call this when user says yes, yeah, ok, sure, or similar affirmative responses after the form offer."""
+        """Send the form/booking link via WhatsApp. Call ONLY after you have asked "Want me to send it?" AND the user said yes. Never call this before offering and getting their consent. After this, speak a closing message, then call end_call."""
         if not self.participant:
             logger.error("[FORM] No participant available to send form")
             return "Error: No participant information available"
-        
+
         phone_number = self.extract_phone_number(self.participant.identity)
         logger.info(f"[FORM] Sending form to {phone_number}")
-        
+
         # Get WhatsApp API URL from environment
         whatsapp_api_url = os.getenv("WHATSAPP_API_URL")
         if not whatsapp_api_url:
             logger.error("[FORM] WHATSAPP_API_URL not set in environment")
             return "Error: WhatsApp API URL not configured"
-        
+
         logger.info(f"[FORM] Using WhatsApp API URL: {whatsapp_api_url}")
-        
+
+        # Mark a send as in flight so end_call waits for us to finish.
+        self._form_done.clear()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -388,10 +384,12 @@ class InboundCaller(Agent):
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     result = await response.json()
-                    
+
                     if result.get("success"):
                         channel = result.get("channel", "unknown")
-                        logger.info(f"[FORM] Successfully sent via {channel} to {phone_number}")
+                        self._form_sent = True
+                        logger.info(
+                            f"[FORM] Successfully sent via {channel} to {phone_number}")
                         return f"Form sent successfully via {channel.upper()}"
                     else:
                         error = result.get("error", "Unknown error")
@@ -400,6 +398,9 @@ class InboundCaller(Agent):
         except Exception as e:
             logger.error(f"[FORM] Error sending form: {e}")
             return f"Error sending form: {str(e)}"
+        finally:
+            # Always release end_call, even if the request failed.
+            self._form_done.set()
 
 
 # ── Server & Entrypoint ──────────────────────────────────────────────
@@ -426,28 +427,26 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info(f"Caller joined: {participant.identity}")
         agent.set_participant(participant)
-        
+
         # Log call start to backend
         await agent.log_call_to_backend(status="ongoing")
 
     session = AgentSession(
         stt=cartesia.STT(
-            model="ink-whisper",  # Cartesia's multilingual STT model (supports English, Arabic, French)
+            # Cartesia's multilingual STT model (supports English, Arabic, French)
+            model="ink-whisper",
             language="en"  # Start with English, can switch dynamically
         ),
-        llm=openai.LLM(
-            model="llama-3.3-70b-versatile",  # This model supports prompt caching
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("GROQ_API_KEY"),
+        llm=groq.LLM(
+            model="llama-3.3-70b-versatile",
         ),
         tts=cartesia.TTS(
             model="sonic-3",
             voice="f786b574-daa5-4673-aa0c-cbe3e8534c02",
             language="en",
         ),
-        vad=silero.VAD.load(),
         turn_handling=TurnHandlingOptions(
-            turn_detection=MultilingualModel(),
+            turn_detection=inference.TurnDetector(),
             interruption=InterruptionOptions(
                 enabled=True,
                 mode="adaptive",
