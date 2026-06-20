@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import asyncio
 import aiohttp
 from datetime import datetime
@@ -37,6 +38,22 @@ from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
 load_dotenv()
 logger = logging.getLogger("inbound-caller")
 logger.setLevel(logging.INFO)
+
+# Regex to strip Llama-style function call syntax that leaks into text output
+_FUNC_CALL_RE = re.compile(
+    r"<function=\w+.*?</function>|<\|.*?\|>",
+    re.DOTALL,
+)
+
+
+def _sanitize_tts_text(text: str) -> str:
+    """Strip leaked tool-call syntax so it never reaches TTS / the caller's ear."""
+    cleaned = _FUNC_CALL_RE.sub("", text).strip()
+    if cleaned != text:
+        logger.warning(
+            f"[TTS FILTER] Stripped leaked function call from speech: {len(text) - len(cleaned)} chars removed")
+    return cleaned
+
 
 # Suppress harmless Windows IPC errors
 logging.getLogger("livekit.agents.utils.aio.duplex_unix").setLevel(
@@ -132,6 +149,7 @@ class InboundCaller(Agent):
         self._form_done.set()
         self._form_sent = False
         self._ending = False  # guards against end_call running twice
+        self._scored = False  # set when score_and_route_lead has been called
 
         # Lead scoring attributes
         self.lead_score = {
@@ -154,6 +172,15 @@ class InboundCaller(Agent):
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
+
+    async def tts_node(self, text, model_settings):
+        """Filter leaked function-call syntax from text before it reaches TTS."""
+        async def _filtered_text():
+            async for chunk in text:
+                cleaned = _FUNC_CALL_RE.sub("", chunk)
+                if cleaned:
+                    yield cleaned
+        return Agent.default.tts_node(self, _filtered_text(), model_settings)
 
     def extract_phone_number(self, identity: str) -> str:
         """Extract phone number from SIP identity like 'sip_+917780313547'"""
@@ -247,6 +274,8 @@ class InboundCaller(Agent):
             score_int = 0
         score_int = max(0, min(100, score_int))
 
+        self._scored = True
+
         # Normalize priority; derive from score if the model sent something odd.
         priority = (priority or "").strip().upper()
         if priority not in ("HOT", "WARM", "COOL", "LOW"):
@@ -274,23 +303,27 @@ class InboundCaller(Agent):
         logger.info(
             f"[LEAD SCORE] LLM assessed: {score_int}/100 | Priority: {priority} | Reasoning: {reasoning}")
 
-        # Return routing instruction — ALWAYS ask for consent before sending.
-        # Do NOT tell the model to send directly; it must offer, explain value, and wait for a yes.
+        # Return routing instruction — first REASSURE, then offer with explanation.
         if priority in ("HOT", "WARM"):
             return (f"Lead scored {score_int}/100 — {priority}. "
-                    f"Now OFFER a booking link: explain that our team can walk them through setup/pricing, "
-                    f"and you can send a booking link to their WhatsApp to pick a time — no commitment. "
-                    f"ASK if they'd like that. Do NOT call send_form yet — wait for them to say yes.")
+                    f"FIRST: Acknowledge their problem and reassure them briefly — tell them you can definitely help "
+                    f"with that and your team has done this for similar businesses. Keep it to 1 sentence. "
+                    f"THEN: Offer a booking link — explain that your team can walk them through the exact setup "
+                    f"and pricing, and you can send a booking link to their WhatsApp to pick a time — no commitment. "
+                    f"ASK if they'd like that. Do NOT call send_form yet — wait for yes.")
         elif priority == "COOL":
             return (f"Lead scored {score_int}/100 — {priority}. "
-                    f"Now OFFER a short requirements form: explain it takes a minute to fill out, "
-                    f"our team will put together options tailored to their business — no commitment. "
-                    f"ASK if they'd like it sent to their WhatsApp. Do NOT call send_form yet — wait for yes.")
+                    f"FIRST: Acknowledge their situation positively — tell them that's something you can definitely "
+                    f"help with when they're ready. Keep it to 1 sentence. "
+                    f"THEN: Offer a short requirements form — explain it takes a minute to fill out, "
+                    f"and your team will put together options tailored to their business — no commitment. "
+                    f"ASK if they'd like it sent. Do NOT call send_form yet — wait for yes.")
         else:
             return (f"Lead scored {score_int}/100 — {priority}. "
-                    f"OFFER a quick info form: explain our team can share more tailored info if they fill it out — "
-                    f"no commitment, just helps us understand their needs better. ASK if they'd like it. "
-                    f"Do NOT call send_form unless they say yes. If they decline, just end the call warmly.")
+                    f"FIRST: Acknowledge their situation warmly — say something supportive like 'that makes sense' "
+                    f"or 'no rush at all.' Keep it brief. "
+                    f"THEN: Offer a quick info form — explain your team can share tailored info when they're ready — "
+                    f"no commitment. ASK if they'd like it. Do NOT call send_form unless they say yes.")
 
     @function_tool()
     async def switch_language(self, ctx: RunContext, language: str):
@@ -356,6 +389,12 @@ class InboundCaller(Agent):
     @function_tool()
     async def send_form(self, ctx: RunContext):
         """Send the form/booking link via WhatsApp. Call ONLY after you have asked "Want me to send it?" AND the user said yes. Never call this before offering and getting their consent. After this, speak a closing message, then call end_call."""
+        # Guard: must call score_and_route_lead before sending
+        if not self._scored:
+            logger.warning(
+                "[FORM] send_form called before score_and_route_lead — forcing a score call first")
+            return "ERROR: You must call score_and_route_lead BEFORE send_form. Score the lead first, then offer, then send."
+
         if not self.participant:
             logger.error("[FORM] No participant available to send form")
             return "Error: No participant information available"
